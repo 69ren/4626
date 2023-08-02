@@ -11,13 +11,15 @@ import "./interfaces/IUniswapV2Pair.sol";
 import "./interfaces/IUniswapV2Router.sol";
 
 contract vault is Ownable, ERC4626 {
-    address treasury;
-    address reward;
-    address public multiRewards;
-    address token0;
-    address token1;
-    address public router;
-    address public constant weth = address(0);
+    IERC20 constant __asset =
+        IERC20(0xBB2a2D17685C3BC71562A87fA4f66F68999F59c7);
+    address public treasury;
+    address public constant reward = 0xd07379a755A8f11B57610154861D694b2A0f615a;
+    address public constant multiRewards =
+        0x5240C435e402f995dde9aff97438Dc48f88A0624;
+    address public constant ogre = 0xAB8a1c03b8E4e1D21c8Ddd6eDf9e07f26E843492;
+    address public constant router = 0xaaa3b1F1bd7BCc97fD1917c18ADE665C5D31F066;
+    address public constant weth = 0x4200000000000000000000000000000000000006;
     address[] route;
 
     uint public _totalAssets;
@@ -26,21 +28,12 @@ contract vault is Ownable, ERC4626 {
     uint public pairFee;
 
     constructor(
-        IERC20 asset,
         string memory name,
-        string memory symbol,
-        address _reward,
-        address _multiRewards,
-        address _router
-    ) ERC20(name, symbol) ERC4626(asset) {
-        multiRewards = _multiRewards;
-        router = _router;
-        reward = _reward;
-        asset.approve(_multiRewards, type(uint).max);
+        string memory symbol
+    ) ERC20(name, symbol) ERC4626(__asset) {
+        __asset.approve(multiRewards, type(uint).max);
         reinvestFee = 10;
         treasuryFee = 50;
-        token0 = IUniswapV2Pair(address(asset)).token0();
-        token1 = IUniswapV2Pair(address(asset)).token1();
     }
 
     function setReinvestFee(uint fee) external onlyOwner {
@@ -87,20 +80,17 @@ contract vault is Ownable, ERC4626 {
         bal -= (_reinvestFee + _treasuryFee);
 
         (uint swapAmount, uint amountOut) = _calcSwap(bal);
-        address pair = asset();
+        address pair = address(__asset);
         IERC20(weth).transfer(pair, swapAmount);
 
-        if (weth == token0) {
-            IUniswapV2Pair(pair).swap(0, amountOut, address(this), "");
-        } else {
-            IUniswapV2Pair(pair).swap(amountOut, 0, address(this), "");
-        }
+        // weth is token0
+        IUniswapV2Pair(pair).swap(0, amountOut, address(this), "");
 
         // check actual balances
-        uint bal0 = IERC20(token0).balanceOf(address(this));
-        uint bal1 = IERC20(token1).balanceOf(address(this));
-        IERC20(token0).transfer(pair, bal0);
-        IERC20(token1).transfer(pair, bal1);
+        uint bal0 = IERC20(weth).balanceOf(address(this));
+        uint bal1 = IERC20(ogre).balanceOf(address(this));
+        IERC20(weth).transfer(pair, bal0);
+        IERC20(ogre).transfer(pair, bal1);
 
         uint liquidity = IUniswapV2Pair(pair).mint(address(this));
         IMultiRewards(multiRewards).stake(liquidity);
@@ -112,12 +102,7 @@ contract vault is Ownable, ERC4626 {
         uint256 assets,
         uint256 shares
     ) internal override {
-        SafeERC20.safeTransferFrom(
-            IERC20(asset()),
-            caller,
-            address(this),
-            assets
-        );
+        SafeERC20.safeTransferFrom(__asset, caller, address(this), assets);
         IMultiRewards(multiRewards).stake(assets);
         _mint(receiver, shares);
         emit Deposit(caller, receiver, assets, shares);
@@ -136,7 +121,7 @@ contract vault is Ownable, ERC4626 {
 
         _burn(owner, shares);
         IMultiRewards(multiRewards).withdraw(assets);
-        SafeERC20.safeTransfer(IERC20(asset()), receiver, assets);
+        SafeERC20.safeTransfer(__asset, receiver, assets);
 
         emit Withdraw(caller, receiver, owner, assets, shares);
     }
@@ -146,10 +131,7 @@ contract vault is Ownable, ERC4626 {
     ) internal view returns (uint swapAmount, uint amountOut) {
         // (sqrt(((2 - f)r)^2 + 4(1 - f)ar) - (2 - f)r) / (2(1 - f))
         (uint reserve0, uint reserve1, ) = IUniswapV2Pair(asset())
-            .getReserves();
-        (reserve0, reserve1) = token0 == weth
-            ? (reserve0, reserve1)
-            : (reserve1, reserve0);
+            .getReserves(); // not sorting as we know weth is token0
         uint x = 1997;
         uint y = 3988000;
         uint z = 1994;

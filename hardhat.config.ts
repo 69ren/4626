@@ -20,7 +20,7 @@ const config: HardhatUserConfig = {
   networks: {
     hardhat: {
       forking: {
-        url: `https://arbitrum-one.public.blastapi.io/`
+        url: `https://base.blockpi.network/v1/rpc/public	`
       },
       accounts: [
         {
