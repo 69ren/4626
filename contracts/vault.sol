@@ -9,7 +9,7 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./interfaces/IMultiRewards.sol";
 import "./interfaces/IUniswapV2Pair.sol";
 import "./interfaces/IUniswapV2Router.sol";
-
+/// @notice all values are hardcoded and made specifically for swapBased dex
 contract vault is Ownable, ERC4626 {
     IERC20 constant __asset =
         IERC20(0xBB2a2D17685C3BC71562A87fA4f66F68999F59c7);
@@ -27,6 +27,17 @@ contract vault is Ownable, ERC4626 {
     uint public treasuryFee;
     uint public pairFee;
 
+    bool public reinvestOnDeposit;
+
+    event Reinvest(address indexed caller, uint bounty, uint fee);
+
+    modifier checkOnDeposit() {
+        if (reinvestOnDeposit) {
+            reinvest(address(0));
+        }
+        _;
+    }
+
     constructor(
         string memory name,
         string memory symbol
@@ -34,6 +45,46 @@ contract vault is Ownable, ERC4626 {
         __asset.approve(multiRewards, type(uint).max);
         reinvestFee = 10;
         treasuryFee = 50;
+    }
+
+    function reinvest(address to) public {
+        IMultiRewards(multiRewards).getReward();
+        swapToWeth(reward);
+
+        uint bal = IERC20(weth).balanceOf(address(this));
+        if (bal > 0) {
+            uint _reinvestFee = to == address(0)
+                ? 0
+                : (bal * reinvestFee) / 1000;
+            uint _treasuryFee = (bal * treasuryFee) / 1000;
+
+            if (_reinvestFee > 0) {
+                IERC20(weth).transfer(to, _reinvestFee);
+            }
+
+            IERC20(weth).transfer(treasury, _treasuryFee);
+            bal -= (_reinvestFee + _treasuryFee);
+            (uint swapAmount, uint amountOut) = _calcSwap(bal);
+            address pair = address(__asset);
+            IERC20(weth).transfer(pair, swapAmount);
+
+            // weth is token0
+            IUniswapV2Pair(pair).swap(0, amountOut, address(this), "");
+
+            // check actual balances
+            uint bal0 = IERC20(weth).balanceOf(address(this));
+            uint bal1 = IERC20(ogre).balanceOf(address(this));
+            IERC20(weth).transfer(pair, bal0);
+            IERC20(ogre).transfer(pair, bal1);
+
+            uint liquidity = IUniswapV2Pair(pair).mint(address(this));
+            IMultiRewards(multiRewards).stake(liquidity);
+            emit Reinvest(msg.sender, _reinvestFee, _treasuryFee);
+        }
+    }
+
+    function setReinvestOnDeposit(bool _reinvest) external onlyOwner {
+        reinvestOnDeposit = _reinvest;
     }
 
     function setReinvestFee(uint fee) external onlyOwner {
@@ -48,52 +99,32 @@ contract vault is Ownable, ERC4626 {
         treasury = _treasury;
     }
 
+    function getRoute() external view returns (address[] memory _route) {
+        _route = route;
+    }
+
     function totalAssets() public view override returns (uint bal) {
         bal = IMultiRewards(multiRewards).balanceOf(address(this));
     }
 
+    /// @notice set route from farm token to weth.
     function setRoute(address[] calldata _route) external onlyOwner {
         route = _route;
         IERC20(_route[0]).approve(router, type(uint).max);
     }
 
+    /// @notice swaps farm token balance to weth
     function swapToWeth(address token) internal {
         uint bal = IERC20(token).balanceOf(address(this));
-        IUniswapV2Router(router).swapExactTokensForTokens(
-            bal,
-            0,
-            route,
-            address(this),
-            block.timestamp
-        );
-    }
-
-    function reinvest() external {
-        IMultiRewards(multiRewards).getReward();
-        swapToWeth(reward);
-
-        uint bal = IERC20(weth).balanceOf(address(this));
-        uint _reinvestFee = (bal * reinvestFee) / 1000;
-        uint _treasuryFee = (bal * treasuryFee) / 1000;
-        IERC20(weth).transfer(msg.sender, _reinvestFee);
-        IERC20(weth).transfer(treasury, _treasuryFee);
-        bal -= (_reinvestFee + _treasuryFee);
-
-        (uint swapAmount, uint amountOut) = _calcSwap(bal);
-        address pair = address(__asset);
-        IERC20(weth).transfer(pair, swapAmount);
-
-        // weth is token0
-        IUniswapV2Pair(pair).swap(0, amountOut, address(this), "");
-
-        // check actual balances
-        uint bal0 = IERC20(weth).balanceOf(address(this));
-        uint bal1 = IERC20(ogre).balanceOf(address(this));
-        IERC20(weth).transfer(pair, bal0);
-        IERC20(ogre).transfer(pair, bal1);
-
-        uint liquidity = IUniswapV2Pair(pair).mint(address(this));
-        IMultiRewards(multiRewards).stake(liquidity);
+        if (bal > 0) {
+            IUniswapV2Router(router).swapExactTokensForTokens(
+                bal,
+                0,
+                route,
+                address(this),
+                block.timestamp
+            );
+        }
     }
 
     function _deposit(
@@ -101,7 +132,7 @@ contract vault is Ownable, ERC4626 {
         address receiver,
         uint256 assets,
         uint256 shares
-    ) internal override {
+    ) internal override checkOnDeposit {
         SafeERC20.safeTransferFrom(__asset, caller, address(this), assets);
         IMultiRewards(multiRewards).stake(assets);
         _mint(receiver, shares);
@@ -140,9 +171,9 @@ contract vault is Ownable, ERC4626 {
                 reserve0 *
                 x) /
             z;
-        amountA = (amountA - swapAmount) * 997;
+        amountA -= swapAmount;
         amountOut =
-            (amountA - swapAmount * reserve1) /
+            (amountA * 997 * reserve1) /
             (reserve0 * 1000 + amountA);
     }
 }
