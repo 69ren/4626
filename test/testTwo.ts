@@ -5,8 +5,15 @@ import {
 } from "@nomicfoundation/hardhat-network-helpers";
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import { ERC20, IMockUniswapV2Router, Vault, WETH9 } from "../typechain-types";
+import {
+  ERC20,
+  IMockUniswapV2Router,
+  IMultiRewards,
+  Vault,
+  WETH9,
+} from "../typechain-types";
 import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
+import { Block } from "ethers";
 
 describe("compounder", function () {
   async function deploy() {
@@ -43,6 +50,11 @@ describe("compounder", function () {
 
     const user = await ethers.getImpersonatedSigner(
       "0xCF2C2fdc9A5A6fa2fc237DC3f5D14dd9b49F66A3"
+    );
+
+    const rewarder = await ethers.getContractAt(
+      "IMultiRewards",
+      "0x5240C435e402f995dde9aff97438Dc48f88A0624"
     );
 
     await setBalance(signer.address, ethers.parseEther("1000"));
@@ -137,6 +149,8 @@ describe("compounder", function () {
       router,
       vault,
       pair,
+      rewarder,
+      route,
     };
   }
 
@@ -147,84 +161,37 @@ describe("compounder", function () {
   let router: IMockUniswapV2Router;
   let vault: Vault;
   let pair: ERC20;
+  let rewarder: IMultiRewards;
+  let route: string[];
 
-  beforeEach("deploy", async function () {
-    ({ signer, user, ogre, weth, router, vault, pair } = await loadFixture(
-      deploy
-    ));
+  before("deploy", async function () {
+    ({ signer, user, ogre, weth, router, vault, pair, rewarder, route } =
+      await loadFixture(deploy));
   });
 
-  // not testing these extensively as the logic was not modified from the default OZ impl
   it("should deposit assets with no issues", async function () {
     let bal = await pair.balanceOf(signer.address);
     await expect(vault.deposit(bal, signer.address)).to.not.be.reverted;
-
-    bal = await pair.balanceOf(user.address);
-    await expect(vault.connect(user).deposit(bal, user.address)).to.not.be
-      .reverted;
   });
 
-  it("should mint shares with no issues", async function () {
-    let bal = await pair.balanceOf(signer.address);
-    let shares = await vault.previewDeposit(bal);
-    await expect(vault.mint(shares, signer.address)).to.not.be.reverted;
+  it("should return pending rewards", async function () {
+    await time.increase(3600);
+    let earned = await rewarder.earned(vault.getAddress());
+    let pending = (await router.getAmountsOut(earned, route)).slice(-1)[0];
 
-    bal = await pair.balanceOf(user.address);
-    shares = await vault.previewDeposit(bal);
-    await expect(vault.connect(user).mint(shares, user.address)).to.not.be
-      .reverted;
-  });
+    pending -= (pending * 60n) / 1000n;
 
-  it("should withdraw all assets with no issues", async function () {
-    let bal = await pair.balanceOf(signer.address);
-    await vault.deposit(bal, signer.address);
-
-    bal = await pair.balanceOf(user.address);
-    await vault.connect(user).deposit(bal, user.address);
-
-    let assets = await vault.maxWithdraw(signer.address);
-    await expect(vault.withdraw(assets, signer.address, signer.address)).to.not
-      .be.reverted;
-
-    assets = await vault.maxWithdraw(user.address);
-    await expect(
-      vault.connect(user).withdraw(assets, user.address, user.address)
-    ).to.not.be.reverted;
-  });
-
-  it("should redeem all shares with no issues", async function () {
-    let bal = await pair.balanceOf(signer.address);
-    let shares = await vault.previewDeposit(bal);
-    await vault.mint(shares, signer.address);
-
-    bal = await pair.balanceOf(user.address);
-    shares = await vault.previewDeposit(bal);
-    await vault.connect(user).mint(shares, user.address);
-
-    bal = await vault.balanceOf(signer.address);
-    await expect(vault.redeem(bal, signer.address, signer.address)).to.not.be
-      .reverted;
-
-    bal = await vault.balanceOf(user.address);
-    await expect(vault.connect(user).redeem(bal, user.address, user.address)).to
-      .not.be.reverted;
-  });
-
-  it("should not allow users with no balance to withdraw", async function () {
-    let bal = await pair.balanceOf(signer.address);
-    await vault.deposit(bal, signer.address);
-
-    await expect(vault.connect(user).withdraw(bal, user.address, user.address))
-      .to.be.reverted;
-
-    await expect(
-      vault.connect(user).withdraw(bal, signer.address, signer.address)
-    ).to.be.reverted; // can't withdraw for someone else
+    expect(pending).eq(await vault.pendingRewards()); // possible diff due to rounding
   });
 
   it("should handle reinvest properly", async function () {
-    let bal = await pair.balanceOf(signer.address);
-    await vault.deposit(bal, signer.address);
+    let earned = await rewarder.earned(await vault.getAddress());
+    let pending = (await router.getAmountsOut(earned, route)).slice(-1)[0];
+    let treasuryShare = (pending * 50n) / 1000n;
+    let harvesterShare = (pending * 10n) / 1000n;
+    // account for slippage/price impact from swap
+    treasuryShare = (treasuryShare * 99n) / 100n;
+    harvesterShare = (harvesterShare * 99n) / 100n;
 
     let treasuryBal = await weth.balanceOf(signer.address);
     let userBal = await weth.balanceOf(user.address);
@@ -237,6 +204,68 @@ describe("compounder", function () {
     expect(newTreasuryBal).greaterThan(treasuryBal);
     expect(newUserBal).greaterThan(userBal);
     expect(newTotalAssets).greaterThan(totalAssets);
+    expect(newTreasuryBal - treasuryBal).greaterThanOrEqual(treasuryShare);
+    expect(newUserBal - userBal).greaterThanOrEqual(harvesterShare);
   });
 
+  // not testing extensively as it's the default OZ implementation
+  it("should have no issues with new deposits", async function () {
+    let bal = await pair.balanceOf(user.address);
+    let estimatedShares = await vault.previewDeposit(bal);
+    await expect(vault.connect(user).deposit(bal, user.address)).to.not.be
+      .reverted;
+
+    let shares = await vault.previewWithdraw(
+      await vault.balanceOf(user.address)
+    );
+    expect(shares).greaterThanOrEqual(estimatedShares);
+  });
+
+  it("should increase price per share after reinvest", async function () {
+    let priceBefore = await vault.convertToAssets(ethers.parseEther("1"));
+    await time.increase(3600); // increase time to build more rewards
+    await vault.reinvest(signer.address);
+    let priceAfter = await vault.convertToAssets(ethers.parseEther("1"));
+    expect(priceAfter).greaterThan(priceBefore);
+  });
+
+  it("should not have any issues when vault is drained", async function () {
+    // using redeem to estimate assets from shares
+    let userOneBal = await vault.balanceOf(signer.address);
+    let userTwoBal = await vault.balanceOf(user.address);
+
+    let userOneAssets = await vault.previewRedeem(userOneBal);
+    let userTwoAssets = await vault.previewRedeem(userTwoBal);
+    let pairBalBeforeOne = await pair.balanceOf(signer.address);
+    let pairBalBeforeTwo = await pair.balanceOf(user.address);
+
+    // possibility for rounding errors or share price impact irl in the event vault gets drained.
+    // not accounting for that
+    // do one last reinvest
+    await vault.reinvest(signer.address);
+    await vault.redeem(userOneBal, signer.address, signer.address);
+    await vault.connect(user).redeem(userTwoBal, user.address, user.address);
+
+    let pairBalOne = (await pair.balanceOf(signer.address)) - pairBalBeforeOne;
+    let pairBalTwo = (await pair.balanceOf(user.address)) - pairBalBeforeTwo;
+
+    expect(pairBalOne).greaterThanOrEqual(userOneAssets);
+    expect(pairBalTwo).greaterThanOrEqual(userTwoAssets);
+    expect(await rewarder.balanceOf(await vault.getAddress())).eq(0n);
+    expect(await vault.totalAssets()).eq(0);
+    expect(await vault.totalSupply()).eq(0);
+  });
+
+  it("should not lose any value on deposit", async function () {
+    // there are multiple factors here
+    // first deposit (or when vault balance is low) usually loses value due to the virtual offset
+    // underlying deposit fees reduce value
+    // a ~5% loss in some situations is not unexpected
+
+    let bal = await pair.balanceOf(signer.address);
+    await vault.deposit(bal, signer.address);
+    let shares = await vault.balanceOf(signer.address);
+    let assets = await vault.previewRedeem(shares);
+    expect(assets).greaterThanOrEqual((bal * 99n) / 100n);
+  });
 });

@@ -9,6 +9,7 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./interfaces/IMultiRewards.sol";
 import "./interfaces/IUniswapV2Pair.sol";
 import "./interfaces/IUniswapV2Router.sol";
+
 /// @notice all values are hardcoded and made specifically for swapBased dex
 contract vault is Ownable, ERC4626 {
     IERC20 constant __asset =
@@ -25,7 +26,6 @@ contract vault is Ownable, ERC4626 {
     uint public _totalAssets;
     uint public reinvestFee;
     uint public treasuryFee;
-    uint public pairFee;
 
     bool public reinvestOnDeposit;
 
@@ -52,7 +52,7 @@ contract vault is Ownable, ERC4626 {
         swapToWeth(reward);
 
         uint bal = IERC20(weth).balanceOf(address(this));
-        if (bal > 0) {
+        if (bal > 0 && totalSupply() > 0) {
             uint _reinvestFee = to == address(0)
                 ? 0
                 : (bal * reinvestFee) / 1000;
@@ -83,36 +83,6 @@ contract vault is Ownable, ERC4626 {
         }
     }
 
-    function setReinvestOnDeposit(bool _reinvest) external onlyOwner {
-        reinvestOnDeposit = _reinvest;
-    }
-
-    function setReinvestFee(uint fee) external onlyOwner {
-        reinvestFee = fee;
-    }
-
-    function setTreasuryFee(uint fee) external onlyOwner {
-        treasuryFee = fee;
-    }
-
-    function setTreasury(address _treasury) external onlyOwner {
-        treasury = _treasury;
-    }
-
-    function getRoute() external view returns (address[] memory _route) {
-        _route = route;
-    }
-
-    function totalAssets() public view override returns (uint bal) {
-        bal = IMultiRewards(multiRewards).balanceOf(address(this));
-    }
-
-    /// @notice set route from farm token to weth.
-    function setRoute(address[] calldata _route) external onlyOwner {
-        route = _route;
-        IERC20(_route[0]).approve(router, type(uint).max);
-    }
-
     /// @notice swaps farm token balance to weth
     function swapToWeth(address token) internal {
         uint bal = IERC20(token).balanceOf(address(this));
@@ -125,6 +95,24 @@ contract vault is Ownable, ERC4626 {
                 block.timestamp
             );
         }
+    }
+
+    function _calcSwap(
+        uint amountA
+    ) internal view returns (uint swapAmount, uint amountOut) {
+        // (sqrt(((2 - f)r)^2 + 4(1 - f)ar) - (2 - f)r) / (2(1 - f))
+        (uint reserve0, uint reserve1, ) = IUniswapV2Pair(asset())
+            .getReserves(); // not sorting as we know weth is token0
+        uint x = 1997;
+        uint y = 3988000;
+        uint z = 1994;
+        swapAmount =
+            (Math.sqrt(reserve0 * (x * x * reserve0 + amountA * y)) -
+                reserve0 *
+                x) /
+            z;
+        amountA -= swapAmount;
+        amountOut = (amountA * 997 * reserve1) / (reserve0 * 1000 + amountA);
     }
 
     function _deposit(
@@ -157,23 +145,43 @@ contract vault is Ownable, ERC4626 {
         emit Withdraw(caller, receiver, owner, assets, shares);
     }
 
-    function _calcSwap(
-        uint amountA
-    ) internal view returns (uint swapAmount, uint amountOut) {
-        // (sqrt(((2 - f)r)^2 + 4(1 - f)ar) - (2 - f)r) / (2(1 - f))
-        (uint reserve0, uint reserve1, ) = IUniswapV2Pair(asset())
-            .getReserves(); // not sorting as we know weth is token0
-        uint x = 1997;
-        uint y = 3988000;
-        uint z = 1994;
-        swapAmount =
-            (Math.sqrt(reserve0 * (x * x * reserve0 + amountA * y)) -
-                reserve0 *
-                x) /
-            z;
-        amountA -= swapAmount;
-        amountOut =
-            (amountA * 997 * reserve1) /
-            (reserve0 * 1000 + amountA);
+    function pendingRewards() external view returns (uint pending) {
+        pending = IMultiRewards(multiRewards).earned(address(this));
+        if (pending > 0) {
+            pending = IUniswapV2Router(router).getAmountsOut(pending, route)[
+                route.length - 1
+            ];
+            pending -= (pending * (reinvestFee + treasuryFee)) / 1000;
+        }
+    }
+
+    function setReinvestOnDeposit(bool _reinvest) external onlyOwner {
+        reinvestOnDeposit = _reinvest;
+    }
+
+    function setReinvestFee(uint fee) external onlyOwner {
+        reinvestFee = fee;
+    }
+
+    function setTreasuryFee(uint fee) external onlyOwner {
+        treasuryFee = fee;
+    }
+
+    function setTreasury(address _treasury) external onlyOwner {
+        treasury = _treasury;
+    }
+
+    function getRoute() external view returns (address[] memory _route) {
+        _route = route;
+    }
+
+    function totalAssets() public view override returns (uint bal) {
+        bal = IMultiRewards(multiRewards).balanceOf(address(this));
+    }
+
+    /// @notice set route from farm token to weth.
+    function setRoute(address[] calldata _route) external onlyOwner {
+        route = _route;
+        IERC20(_route[0]).approve(router, type(uint).max);
     }
 }
